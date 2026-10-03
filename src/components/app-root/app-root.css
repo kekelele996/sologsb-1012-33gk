@@ -219,3 +219,63 @@ ion-content { --background: var(--studio-canvas); }
   .editor-panel { overflow: visible; }
   .editor-scroll { overflow: visible; }
 }
+
+/* 教师端 / 拍摄组端角色切换 */
+.role-segment { min-width: 168px; margin-right: 10px; --background: rgba(255,255,255,.12); border-radius: 7px; }
+.role-segment ion-segment-button { --color: #b9d4cd; --color-checked: #163f36; --background-checked: #d8f6ea; font-size: 10px; min-height: 30px; }
+
+.crew-workspace { grid-template-columns: 280px minmax(560px, 1fr); }
+.crew-panel .panel-switcher button { cursor: default; }
+.crew-readonly-hint { color: var(--studio-muted); font-size: 10px; line-height: 1.6; }
+.crew-board { padding: 18px 20px 80px; }
+.crew-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 12px; }
+.crew-stats > div { padding: 10px; border: 1px solid var(--studio-line); border-radius: 8px; background: #f8fbfa; }
+.crew-stats strong, .crew-stats span { display: block; }
+.crew-stats strong { font-size: 20px; }
+.crew-stats span { color: var(--studio-muted); font-size: 9px; }
+.crew-stats .has-errors strong { color: var(--studio-danger); }
+.crew-task-list, .suspended-list { display: flex; flex-direction: column; gap: 7px; }
+.crew-empty { margin: 6px 0; color: var(--studio-muted); font-size: 11px; }
+.crew-task { width: 100%; padding: 11px 12px; display: grid; grid-template-columns: 78px 1fr auto; align-items: center; gap: 10px; border: 1px solid var(--studio-line); border-left-width: 4px; border-radius: 8px; background: #fbfdfc; text-align: left; cursor: pointer; }
+.crew-task.status-open { border-left-color: #8a9b96; }
+.crew-task.status-pending { border-left-color: #d92d20; background: #fff7f5; }
+.crew-task.status-confirmed { border-left-color: #2e8a60; }
+.crew-task-copy { min-width: 0; }
+.crew-task-copy strong { display: block; font-size: 12px; }
+.crew-task-copy small { display: block; margin-top: 2px; color: var(--studio-muted); font-size: 9px; }
+.crew-task-copy .crew-hold { color: #a0441f; }
+.crew-task-meta { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
+.crew-task-meta small { color: var(--studio-muted); font-size: 9px; }
+.shoot-code { font: 600 11px/1 "SFMono-Regular", monospace; color: #167064; letter-spacing: .03em; }
+.crew-return-actions { margin-top: 9px; display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.crew-return-actions span { color: var(--studio-muted); font-size: 9px; }
+.return-textarea { --min-height: 92px; font: 11px/1.6 "SFMono-Regular", monospace; }
+.crew-boundary-hint { margin: 8px 0 0; padding: 7px 10px; border-radius: 6px; background: #eef5f2; color: #42645c; font-size: 9px; }
+.suspended-item { padding: 10px 12px; display: flex; align-items: center; justify-content: space-between; gap: 10px; border: 1px solid #f0d2b8; border-left: 4px solid #d97c2b; border-radius: 8px; background: #fffaf4; }
+.suspended-item strong, .suspended-item span, .suspended-item small { display: block; }
+.suspended-item strong { font: 600 11px/1 "SFMono-Regular", monospace; }
+.suspended-item span { margin-top: 4px; color: #8e4b12; font-size: 10px; }
+.suspended-item small { margin-top: 3px; color: var(--studio-muted); font-size: 9px; word-break: break-all; }
+.crew-retry-all { align-self: flex-end; }
+
+/* 步骤编辑器里的拍摄协作横幅 */
+.shoot-callout { margin-bottom: 12px; padding: 11px 13px; border: 1px solid var(--studio-line); border-left-width: 4px; border-radius: 8px; background: #fff; }
+.shoot-callout.shoot-confirmed { border-left-color: #2e8a60; background: #f2faf6; }
+.shoot-callout.shoot-pending { border-left-color: #d92d20; background: #fff6f4; }
+.shoot-callout.shoot-open { border-left-color: #8a9b96; background: #f7faf9; }
+.shoot-callout.shoot-missing { border-left-color: #d92d20; background: #fff6f4; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.shoot-callout-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.shoot-callout-head strong { font-size: 12px; }
+.shoot-callout-head span { display: block; }
+.shoot-callout-head > div span { margin-top: 3px; color: var(--studio-muted); font-size: 9px; }
+.shoot-footage-row { margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--studio-line); display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.shoot-footage-row strong, .shoot-footage-row span { display: block; }
+.shoot-footage-row strong { font-size: 11px; }
+.shoot-footage-row span { margin-top: 3px; color: var(--studio-muted); font-size: 9px; word-break: break-all; }
+.shoot-actions { display: flex; gap: 5px; flex-shrink: 0; }
+.shoot-actions .studio-button { --padding-start: 8px; --padding-end: 8px; font-size: 10px; }
+.shoot-hold-reason { margin: 8px 0 0; color: #a0441f; font-size: 9px; }
+
+@media (max-width: 980px) {
+  .crew-workspace { grid-template-columns: 240px 1fr; }
+}

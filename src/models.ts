@@ -23,6 +23,52 @@ export interface LessonStep {
   prerequisiteId: string;
   difficulty: Difficulty;
   cuePoints: number[];
+  shootTaskCode?: string;
+  materialId?: string;
+}
+
+export type ShootTaskStatus = '拍摄中' | '待确认' | '已确认';
+export type FootageState = '回传待判' | '采用' | '停用' | '重拍';
+
+export interface ShootTask {
+  code: string;
+  stepId: string;
+  clipName: string;
+  status: ShootTaskStatus;
+  holdReason?: string;
+  activeFootageId?: string;
+  createdAt: string;
+}
+
+export interface ShootFootage {
+  id: string;
+  taskCode: string;
+  clipName: string;
+  camera: CameraAngle | string;
+  assetUrl: string;
+  state: FootageState;
+  note?: string;
+  returnedAt: string;
+}
+
+export interface PendingReturn {
+  footage: ShootFootage;
+  reason: string;
+  attempts: number;
+  lastAttemptAt: string;
+}
+
+export interface ShootReturnInput {
+  taskCode: string;
+  camera: string;
+  assetUrl: string;
+  clipName?: string;
+}
+
+export interface ShootIngestResult {
+  adopted: string[];
+  pending: string[];
+  suspended: { code: string; reason: string }[];
 }
 
 export interface CourseModule {
@@ -50,6 +96,10 @@ export interface CourseProject {
   selectedStepId: string;
   modules: CourseModule[];
   frozenVersions: FrozenVersion[];
+  shootTasks: ShootTask[];
+  footageLibrary: ShootFootage[];
+  pendingReturns: PendingReturn[];
+  shootSeq: number;
   lastSavedAt: string;
   revision: number;
 }
@@ -195,9 +245,85 @@ export function createDemoProject(): CourseProject {
     selectedStepId: 'step-1-2',
     modules,
     frozenVersions: [],
+    ...seedShootData(modules),
     lastSavedAt: new Date().toISOString(),
     revision: 1,
   };
+}
+
+function seedShootData(modules: CourseModule[]): Pick<CourseProject, 'shootTasks' | 'footageLibrary' | 'pendingReturns' | 'shootSeq'> {
+  const now = new Date().toISOString();
+  const shootTasks: ShootTask[] = [];
+  const footageLibrary: ShootFootage[] = [];
+  let seq = 0;
+  const seedAdopted = new Set(['step-1-1', 'step-1-3']);
+  const seedRetake = new Set(['step-2-2']);
+  modules.forEach((module) => module.steps.forEach((step) => {
+    if (!step.demoTitle.trim()) return;
+    seq += 1;
+    const code = formatShootCode(seq);
+    step.shootTaskCode = code;
+    if (seedAdopted.has(step.id)) {
+      const footage: ShootFootage = {
+        id: `footage-${seq}-1`,
+        taskCode: code,
+        clipName: step.demoTitle,
+        camera: step.camera,
+        assetUrl: `assets/demo/${seq}.mp4`,
+        state: '采用',
+        returnedAt: now,
+      };
+      footageLibrary.push(footage);
+      step.materialId = footage.id;
+      step.demoUrl = footage.assetUrl;
+      shootTasks.push({ code, stepId: step.id, clipName: step.demoTitle, status: '已确认', activeFootageId: footage.id, createdAt: now });
+    } else if (seedRetake.has(step.id)) {
+      const footage: ShootFootage = {
+        id: `footage-${seq}-1`,
+        taskCode: code,
+        clipName: step.demoTitle,
+        camera: step.camera,
+        assetUrl: `assets/demo/${seq}-v1.mp4`,
+        state: '重拍',
+        note: '右手动作出画，需要重拍',
+        returnedAt: now,
+      };
+      footageLibrary.push(footage);
+      shootTasks.push({ code, stepId: step.id, clipName: step.demoTitle, status: '拍摄中', activeFootageId: footage.id, holdReason: '在库素材已标记重拍，等待新素材回传', createdAt: now });
+    } else {
+      shootTasks.push({ code, stepId: step.id, clipName: step.demoTitle, status: '拍摄中', createdAt: now });
+    }
+  }));
+  return { shootTasks, footageLibrary, pendingReturns: [], shootSeq: seq };
+}
+
+export function formatShootCode(seq: number): string {
+  return `STG-${String(seq).padStart(4, '0')}`;
+}
+
+export function isKnownCamera(value: string): value is CameraAngle {
+  return (['正面', '左侧 45°', '右侧 45°', '俯拍手部', '全身远景'] as string[]).includes(value);
+}
+
+/** 按当前字幕位置与回传机位重判字幕安全区是否达标。 */
+export function captionSafeWithCamera(step: Pick<LessonStep, 'captionPosition' | 'gestureZone'>, camera: string): boolean {
+  return !(step.captionPosition === '画面中央' && (step.gestureZone === '中央' || camera === '俯拍手部'));
+}
+
+export function findStepByTaskCode(project: CourseProject, code: string): { module: CourseModule; step: LessonStep } | undefined {
+  for (const module of project.modules) {
+    const step = module.steps.find((candidate) => candidate.shootTaskCode === code);
+    if (step) return { module, step };
+  }
+  return undefined;
+}
+
+export function taskForStep(project: CourseProject, stepId: string): ShootTask | undefined {
+  return project.shootTasks.find((task) => task.stepId === stepId);
+}
+
+export function footageById(project: CourseProject, footageId?: string): ShootFootage | undefined {
+  return footageId ? project.footageLibrary.find((item) => item.id === footageId) : undefined;
 }
 
 export function selectedModule(project: CourseProject): CourseModule {
@@ -248,9 +374,239 @@ export function validateProject(project: CourseProject): ValidationCheck[] {
     });
   });
 
+  project.shootTasks?.forEach((task) => {
+    const located = findStepByTaskCode(project, task.code);
+    if (task.status === '待确认') {
+      const pendingFootage = project.footageLibrary.find((item) => item.taskCode === task.code && item.state === '回传待判');
+      if (pendingFootage && located) {
+        checks.push({
+          id: `safety-${task.code}`,
+          severity: 'error',
+          title: `${located.step.title} 新素材字幕安全区不达标`,
+          detail: `机位“${pendingFootage.camera}”与${located.step.captionPosition}冲突，请更换素材或调整字幕位置后重新判定。`,
+          stepId: located.step.id,
+        });
+      } else {
+        checks.push({
+          id: `hold-${task.code}`,
+          severity: 'warning',
+          title: `${located?.step.title ?? task.clipName} 的拍摄任务待确认`,
+          detail: task.holdReason || '素材停用或重拍后引用步骤进入待确认，等待教师处理。',
+          stepId: located?.step.id,
+        });
+      }
+    }
+  });
+
   return checks;
 }
 
 export function cloneProject(project: CourseProject): CourseProject {
   return structuredClone(project);
+}
+
+/**
+ * 旧数据没有拍摄任务编号：升级时按现有示范片段名称回填拍摄任务，
+ * 已回传过素材地址的步骤视为素材已采用并挂上任务。
+ */
+export function migrateShootDomain(raw: Partial<CourseProject>): CourseProject {
+  const project = raw as CourseProject;
+  const now = new Date().toISOString();
+  if (!Array.isArray(project.shootTasks)) project.shootTasks = [];
+  if (!Array.isArray(project.footageLibrary)) project.footageLibrary = [];
+  if (!Array.isArray(project.pendingReturns)) project.pendingReturns = [];
+  project.shootSeq = typeof project.shootSeq === 'number' ? project.shootSeq : project.shootTasks.length;
+
+  project.modules.forEach((module) => module.steps.forEach((step) => {
+    if (!step.demoTitle.trim() || step.shootTaskCode) return;
+    const byName = project.shootTasks.find((task) => task.clipName === step.demoTitle);
+    if (byName) {
+      step.shootTaskCode = byName.code;
+      return;
+    }
+    project.shootSeq += 1;
+    const code = formatShootCode(project.shootSeq);
+    step.shootTaskCode = code;
+    const task: ShootTask = { code, stepId: step.id, clipName: step.demoTitle, status: '拍摄中', createdAt: now };
+    if (step.demoUrl.trim()) {
+      const footage: ShootFootage = {
+        id: `footage-migrated-${project.shootSeq}`,
+        taskCode: code,
+        clipName: step.demoTitle,
+        camera: step.camera,
+        assetUrl: step.demoUrl,
+        state: '采用',
+        note: '升级时按片段名称回填的历史素材',
+        returnedAt: now,
+      };
+      project.footageLibrary.push(footage);
+      step.materialId = footage.id;
+      task.status = '已确认';
+      task.activeFootageId = footage.id;
+    }
+    project.shootTasks.push(task);
+  }));
+  return project;
+}
+
+/** 教师为新加的示范步骤开一条拍摄任务。 */
+export function openShootTask(project: CourseProject, stepId: string): CourseProject {
+  let step: LessonStep | undefined;
+  for (const module of project.modules) {
+    const found = module.steps.find((candidate) => candidate.id === stepId);
+    if (found) { step = found; break; }
+  }
+  if (!step || step.shootTaskCode || !step.demoTitle.trim()) return project;
+  project.shootSeq += 1;
+  const code = formatShootCode(project.shootSeq);
+  step.shootTaskCode = code;
+  project.shootTasks.push({ code, stepId: step.id, clipName: step.demoTitle, status: '拍摄中', createdAt: new Date().toISOString() });
+  return project;
+}
+
+function applyFootage(project: CourseProject, task: ShootTask, footage: ShootFootage): void {
+  const located = findStepByTaskCode(project, task.code);
+  if (!located) return;
+  const { step } = located;
+  const safe = isKnownCamera(footage.camera) && captionSafeWithCamera(step, footage.camera);
+  project.footageLibrary.push(footage);
+  if (safe) {
+    if (task.activeFootageId) {
+      const previous = project.footageLibrary.find((item) => item.id === task.activeFootageId && item.state === '采用');
+      if (previous) previous.state = '停用';
+    }
+    // 回传只压素材地址与机位，字幕、替代文本、练习均不动。
+    step.materialId = footage.id;
+    step.demoUrl = footage.assetUrl;
+    step.camera = footage.camera as CameraAngle;
+    footage.state = '采用';
+    task.activeFootageId = footage.id;
+    task.status = '已确认';
+    task.holdReason = undefined;
+  } else {
+    footage.state = '回传待判';
+    task.status = '待确认';
+    task.holdReason = '新素材字幕安全区不达标，请教师换素材或调整字幕位置';
+  }
+}
+
+/**
+ * 拍摄组按任务编号批量回传素材与机位。
+ * 对不上的条目只挂起这几条，对上的照常落库；返回成功/挂起明细。
+ */
+export function ingestReturns(project: CourseProject, entries: ShootReturnInput[]): ShootIngestResult {
+  const result: ShootIngestResult = { adopted: [], pending: [], suspended: [] };
+  const nowIso = new Date().toISOString();
+  entries.forEach((entry, index) => {
+    const code = entry.taskCode.trim().toUpperCase();
+    const url = entry.assetUrl.trim();
+    const camera = entry.camera.trim();
+    if (!code) return result.suspended.push({ code: '(空)', reason: '缺少拍摄任务编号' });
+    const task = project.shootTasks.find((item) => item.code === code);
+    if (!task) {
+      result.suspended.push({ code, reason: '任务编号对不上，教师未开出此任务' });
+      return queuePending(project, { ...entry, taskCode: code }, '任务编号对不上，教师未开出此任务', nowIso);
+    }
+    if (!url) {
+      result.suspended.push({ code, reason: '缺少素材地址' });
+      return queuePending(project, { ...entry, taskCode: code }, '缺少素材地址', nowIso);
+    }
+    if (!isKnownCamera(camera)) {
+      result.suspended.push({ code, reason: `机位“${camera || '(空)'}”不在约定机位清单内` });
+      return queuePending(project, { ...entry, taskCode: code, camera }, `机位“${camera || '(空)'}”不在约定机位清单内`, nowIso);
+    }
+    const footage: ShootFootage = {
+      id: `footage-${Date.now().toString(36)}-${index}`,
+      taskCode: code,
+      clipName: entry.clipName?.trim() || task.clipName,
+      camera,
+      assetUrl: url,
+      state: '回传待判',
+      returnedAt: nowIso,
+    };
+    applyFootage(project, task, footage);
+    if (footage.state === '采用') result.adopted.push(code);
+    else result.pending.push(code);
+    project.pendingReturns = project.pendingReturns.filter((item) => item.footage.taskCode !== code);
+  });
+  return result;
+}
+
+function queuePending(project: CourseProject, entry: ShootReturnInput, reason: string, nowIso: string): void {
+  const footage: ShootFootage = {
+    id: `footage-pending-${Date.now().toString(36)}-${Math.round(Math.random() * 1e4)}`,
+    taskCode: entry.taskCode,
+    clipName: entry.clipName?.trim() || '',
+    camera: entry.camera,
+    assetUrl: entry.assetUrl,
+    state: '回传待判',
+    returnedAt: nowIso,
+  };
+  const existing = project.pendingReturns.find((item) => item.footage.taskCode === footage.taskCode);
+  if (existing) {
+    existing.footage = footage;
+    existing.reason = reason;
+    existing.attempts += 1;
+    existing.lastAttemptAt = nowIso;
+  } else {
+    project.pendingReturns.push({ footage, reason, attempts: 1, lastAttemptAt: nowIso });
+  }
+}
+
+/** 失败后只重试挂起的这几条（可单条）。 */
+export function retryReturns(project: CourseProject, codes?: string[]): ShootIngestResult {
+  const targets = project.pendingReturns.filter((item) => !codes || codes.includes(item.footage.taskCode));
+  const entries = targets.map((item) => ({
+    taskCode: item.footage.taskCode,
+    camera: item.footage.camera,
+    assetUrl: item.footage.assetUrl,
+    clipName: item.footage.clipName,
+  }));
+  const tried = new Set(targets.map((item) => item.footage.taskCode));
+  project.pendingReturns = project.pendingReturns.filter((item) => !tried.has(item.footage.taskCode));
+  return ingestReturns(project, entries);
+}
+
+/** 教师调整字幕位置或换素材后，按当前在库素材重新判定安全区。 */
+export function rejudgeTaskSafety(project: CourseProject, taskCode: string): ShootTask | undefined {
+  const task = project.shootTasks.find((item) => item.code === taskCode);
+  const located = findStepByTaskCode(project, taskCode);
+  if (!task || !located) return task;
+  const candidate = project.footageLibrary
+    .filter((item) => item.taskCode === taskCode && item.state === '回传待判')
+    .sort((a, b) => b.returnedAt.localeCompare(a.returnedAt))[0];
+  if (candidate && isKnownCamera(candidate.camera) && captionSafeWithCamera(located.step, candidate.camera)) {
+    located.step.materialId = candidate.id;
+    located.step.demoUrl = candidate.assetUrl;
+    located.step.camera = candidate.camera as CameraAngle;
+    candidate.state = '采用';
+    if (task.activeFootageId) {
+      const previous = project.footageLibrary.find((item) => item.id === task.activeFootageId && item.state === '采用');
+      if (previous) previous.state = '停用';
+    }
+    task.activeFootageId = candidate.id;
+    task.status = '已确认';
+    task.holdReason = undefined;
+  }
+  return task;
+}
+
+/** 素材被标成停用或重拍后，引用它的步骤按新素材重判；拍摄组不替教师改步骤。 */
+export function markFootage(project: CourseProject, footageId: string, state: '停用' | '重拍', note?: string): void {
+  const footage = project.footageLibrary.find((item) => item.id === footageId);
+  if (!footage || (state !== '停用' && state !== '重拍')) return;
+  footage.state = state;
+  if (note) footage.note = note;
+  const task = project.shootTasks.find((item) => item.code === footage.taskCode);
+  if (!task) return;
+  const located = findStepByTaskCode(project, footage.taskCode);
+  if (located && located.step.materialId === footage.id) {
+    located.step.materialId = undefined;
+    located.step.demoUrl = '';
+  }
+  if (task.activeFootageId === footage.id) task.activeFootageId = undefined;
+  task.status = '待确认';
+  task.holdReason = state === '重拍'
+    ? '在库素材已标记重拍，等待拍摄组按任务编号回传新素材'
+    : '在库素材已停用，请教师换素材或等待新回传';
 }

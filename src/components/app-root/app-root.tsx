@@ -1,10 +1,20 @@
 import { Component, Host, State, h, Listen } from '@stencil/core';
 import {
+  captionSafeWithCamera,
   cloneProject,
   createDemoProject,
+  footageById,
+  ingestReturns,
+  isKnownCamera,
+  markFootage,
+  migrateShootDomain,
+  openShootTask,
+  rejudgeTaskSafety,
+  retryReturns,
   selectedModule,
   selectedStep,
   STORAGE_KEY,
+  taskForStep,
   validateProject,
   type CameraAngle,
   type CaptionPosition,
@@ -13,10 +23,13 @@ import {
   type Difficulty,
   type GestureZone,
   type LessonStep,
+  type ShootTask,
   type ValidationCheck,
 } from '../../models';
 
 type PreviewSize = 'phone' | 'tablet';
+type StudioRole = 'teacher' | 'crew';
+const ROLE_KEY = 'sologsb-1012-role';
 
 @Component({
   tag: 'app-root',
@@ -26,11 +39,13 @@ type PreviewSize = 'phone' | 'tablet';
 export class AppRoot {
   @State() project: CourseProject = createDemoProject();
   @State() previewSize: PreviewSize = 'phone';
-  @State() activePanel: 'editor' | 'checks' = 'editor';
+  @State() activePanel: 'editor' | 'checks' | 'shoot' = 'editor';
+  @State() role: StudioRole = (typeof localStorage !== 'undefined' && localStorage.getItem(ROLE_KEY) === 'crew') ? 'crew' : 'teacher';
   @State() playing = false;
   @State() playProgress = 0;
   @State() offline = typeof navigator !== 'undefined' ? !navigator.onLine : false;
   @State() toast?: { color: string; message: string };
+  @State() returnDraft = '';
   private past: CourseProject[] = [];
   private future: CourseProject[] = [];
   private playTimer?: number;
@@ -38,7 +53,11 @@ export class AppRoot {
   componentWillLoad(): void {
     try {
       const saved = localStorage.getItem(STORAGE_KEY);
-      if (saved) this.project = JSON.parse(saved) as CourseProject;
+      if (saved) {
+        const migrated = migrateShootDomain(JSON.parse(saved) as CourseProject);
+        this.project = migrated;
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(migrated));
+      }
     } catch {
       this.project = createDemoProject();
     }
@@ -74,6 +93,7 @@ export class AppRoot {
       this.redo();
       return;
     }
+    if (this.role !== 'teacher') return;
     if (modifier && event.key.toLowerCase() === 's') {
       event.preventDefault();
       this.saveDraft(true);
@@ -133,6 +153,66 @@ export class AppRoot {
     this.persist();
   }
 
+  private switchRole(role: StudioRole): void {
+    this.role = role;
+    localStorage.setItem(ROLE_KEY, role);
+    this.activePanel = role === 'crew' ? 'shoot' : 'editor';
+    this.showToast('success', role === 'crew' ? '已切换到拍摄组工作台：只管拍摄任务与素材回传。' : '已切换到教师工作台：课程模块与学习步骤由教师维护。');
+  }
+
+  /** 教师每加一个示范步骤，就开一条拍摄任务。 */
+  private openTaskForStep(stepId: string): void {
+    this.commit((draft) => openShootTask(draft, stepId), '已开出新的拍摄任务。');
+  }
+
+  private handleMarkFootage(footageId: string, state: '停用' | '重拍'): void {
+    this.commit((draft) => { markFootage(draft, footageId, state); return draft; }, `素材已标记为${state}，引用步骤进入待确认。`);
+  }
+
+  private handleRejudge(taskCode: string): void {
+    this.commit((draft) => {
+      rejudgeTaskSafety(draft, taskCode);
+      return draft;
+    }, '已按新素材与当前字幕位置重新判定安全区。');
+  }
+
+  private submitReturns(raw: string): void {
+    const entries = raw.split('\n').map((line) => line.trim()).filter(Boolean).map((line) => {
+      const [taskCode, camera, assetUrl, clipName] = line.split(/[,，\t]/).map((part) => part?.trim() ?? '');
+      return { taskCode, camera, assetUrl, clipName };
+    }).filter((entry) => entry.taskCode || entry.assetUrl);
+    if (!entries.length) return this.showToast('warning', '请按「任务编号, 机位, 素材地址」每行一条填写回传。');
+    const draft = cloneProject(this.project);
+    const result = ingestReturns(draft, entries);
+    this.applyShootDraft(draft);
+    if (result.adopted.length) this.showToast('success', `${result.adopted.length} 条回传对号入库${result.pending.length ? `；${result.pending.length} 条安全区不达标已挂待确认` : ''}。`);
+    else if (result.pending.length) this.showToast('warning', `${result.pending.length} 条回传安全区不达标，已挂待确认。`);
+    if (result.suspended.length) window.setTimeout(() => this.showToast('danger', `${result.suspended.length} 条对不上，仅挂起这几条，可在下方逐条重试。`), result.adopted.length || result.pending.length ? 400 : 0);
+    this.returnDraft = '';
+  }
+
+  private retryReturn(code?: string): void {
+    const draft = cloneProject(this.project);
+    const result = retryReturns(draft, code ? [code] : undefined);
+    this.applyShootDraft(draft);
+    if (result.adopted.length || result.pending.length) this.showToast('success', `重试完成：入库 ${result.adopted.length} 条，待确认 ${result.pending.length} 条，仍挂起 ${result.suspended.length} 条。`);
+    else this.showToast('warning', '重试仍对不上，条目继续挂起，其它回传不受影响。');
+  }
+
+  private applyShootDraft(next: CourseProject): void {
+    if (this.project.status === 'frozen') {
+      this.showToast('warning', '当前版本已冻结，请先创建修订版。');
+      return;
+    }
+    const before = cloneProject(this.project);
+    next.revision = before.revision + 1;
+    next.lastSavedAt = new Date().toISOString();
+    this.past = [...this.past, before].slice(-80);
+    this.future = [];
+    this.project = next;
+    this.persist();
+  }
+
   private showToast(color: string, message: string): void {
     this.toast = { color, message };
     window.setTimeout(() => {
@@ -154,13 +234,18 @@ export class AppRoot {
   private updateStep(patch: Partial<LessonStep>, toast?: string): void {
     const stepId = this.currentStep?.id;
     if (!stepId) return;
-    this.commit((draft) => ({
-      ...draft,
-      modules: draft.modules.map((module) => module.id === draft.selectedModuleId ? {
+    this.commit((draft) => {
+      const modules = draft.modules.map((module) => module.id === draft.selectedModuleId ? {
         ...module,
         steps: module.steps.map((step) => step.id === stepId ? { ...step, ...patch } : step),
-      } : module),
-    }), toast);
+      } : module);
+      // 教师改示范片段名称时，同步该步骤绑定拍摄任务上的名称。
+      const shootTasks = patch.demoTitle === undefined ? draft.shootTasks : draft.shootTasks.map((task) => {
+        const owned = modules.some((module) => module.steps.some((step) => step.id === stepId && step.shootTaskCode === task.code));
+        return owned ? { ...task, clipName: patch.demoTitle ?? task.clipName } : task;
+      });
+      return { ...draft, modules, shootTasks };
+    }, toast);
   }
 
   private updateCurrentModule(patch: Partial<CourseModule>): void {
@@ -206,25 +291,37 @@ export class AppRoot {
       difficulty: '入门',
       cuePoints: [8, 20, 32],
     };
-    this.commit((draft) => ({
-      ...draft,
-      modules: draft.modules.map((item) => item.id === module.id ? { ...item, steps: [...item.steps, step] } : item),
-      selectedStepId: step.id,
-    }), '已新增学习步骤。');
+    // 教师每加一个示范步骤就开一条拍摄任务。
+    this.commit((draft) => {
+      const withStep: CourseProject = {
+        ...draft,
+        modules: draft.modules.map((item) => item.id === module.id ? { ...item, steps: [...item.steps, step] } : item),
+        selectedStepId: step.id,
+      };
+      return kind === '示范' ? openShootTask(withStep, step.id) : withStep;
+    }, kind === '示范' ? '已新增示范步骤，并开出拍摄任务。' : '已新增学习步骤。');
   }
 
   private duplicateStep(): void {
     const step = this.currentStep;
     if (!step) return;
-    this.commit((draft) => ({
-      ...draft,
-      modules: draft.modules.map((module) => {
-        if (module.id !== draft.selectedModuleId) return module;
-        const index = module.steps.findIndex((item) => item.id === step.id);
-        const duplicate = { ...structuredClone(step), id: `step-${Date.now().toString(36)}`, title: `${step.title}（副本）` };
-        return { ...module, steps: [...module.steps.slice(0, index + 1), duplicate, ...module.steps.slice(index + 1)] };
-      }),
-    }), '已复制当前步骤。');
+    this.commit((draft) => {
+      const moduleIndex = draft.modules.findIndex((module) => module.id === draft.selectedModuleId);
+      const target = draft.modules[moduleIndex];
+      const index = target.steps.findIndex((item) => item.id === step.id);
+      const copy: LessonStep = {
+        ...structuredClone(step),
+        id: `step-${Date.now().toString(36)}`,
+        title: `${step.title}（副本）`,
+        shootTaskCode: undefined,
+        materialId: undefined,
+        demoUrl: '',
+      };
+      const modules = [...draft.modules];
+      modules[moduleIndex] = { ...target, steps: [...target.steps.slice(0, index + 1), copy, ...target.steps.slice(index + 1)] };
+      const inserted: CourseProject = { ...draft, modules, selectedStepId: copy.id };
+      return copy.kind === '示范' ? openShootTask(inserted, copy.id) : inserted;
+    }, '已复制当前步骤。');
   }
 
   private deleteStep(stepId: string): void {
@@ -339,15 +436,165 @@ export class AppRoot {
     return <ion-badge color="medium">草稿</ion-badge>;
   }
 
+  private renderShootBanner(step: LessonStep, frozen: boolean) {
+    const task = taskForStep(this.project, step.id);
+    if (!task) {
+      return (
+        <div class="shoot-callout shoot-missing">
+          <div><strong>尚未开出拍摄任务</strong><span>{step.demoTitle.trim() ? '该示范片段没有任务编号，拍摄组无法回传素材。' : '先填写示范片段名称，再开拍摄任务。'}</span></div>
+          <ion-button size="small" fill="outline" class="studio-button" disabled={frozen || !step.demoTitle.trim()} onClick={() => this.openTaskForStep(step.id)}>补开拍摄任务</ion-button>
+        </div>
+      );
+    }
+    const active = footageById(this.project, task.activeFootageId);
+    const pendingFootage = this.project.footageLibrary
+      .filter((item) => item.taskCode === task.code && item.state === '回传待判')
+      .sort((a, b) => b.returnedAt.localeCompare(a.returnedAt))[0];
+    return (
+      <div class={`shoot-callout shoot-${task.status === '已确认' ? 'confirmed' : task.status === '待确认' ? 'pending' : 'open'}`}>
+        <div class="shoot-callout-head">
+          <div>
+            <strong><span class="shoot-code">{task.code}</span> · {task.status}</strong>
+            <span>拍摄任务绑定示范片段：{task.clipName}</span>
+          </div>
+          <ion-badge color={task.status === '已确认' ? 'success' : task.status === '待确认' ? 'danger' : 'medium'}>{task.status}</ion-badge>
+        </div>
+        {active && (
+          <div class="shoot-footage-row">
+            <div>
+              <strong>{active.state === '采用' ? '在库素材' : `素材已${active.state}`}</strong>
+              <span>机位 {active.camera} · {active.assetUrl || '未填素材地址'}{active.note ? ` · ${active.note}` : ''}</span>
+            </div>
+            {active.state === '采用' && (
+              <div class="shoot-actions">
+                <ion-button size="small" fill="outline" color="warning" class="studio-button" disabled={frozen} onClick={() => this.handleMarkFootage(active.id, '重拍')}>标记重拍</ion-button>
+                <ion-button size="small" fill="outline" color="danger" class="studio-button" disabled={frozen} onClick={() => this.handleMarkFootage(active.id, '停用')}>标记停用</ion-button>
+              </div>
+            )}
+          </div>
+        )}
+        {pendingFootage && (
+          <div class="shoot-footage-row">
+            <div>
+              <strong>新回传素材待教师确认</strong>
+              <span>
+                机位 {pendingFootage.camera} · {pendingFootage.assetUrl || '未填素材地址'} ·
+                {isKnownCamera(pendingFootage.camera) && captionSafeWithCamera(step, pendingFootage.camera)
+                  ? ' 当前字幕位置安全区达标，可直接采用'
+                  : ' 与当前字幕位置冲突，安全区不达标'}
+              </span>
+            </div>
+            <div class="shoot-actions">
+              <ion-button size="small" class="studio-button" disabled={frozen || !isKnownCamera(pendingFootage.camera) || !captionSafeWithCamera(step, pendingFootage.camera)} onClick={() => this.handleRejudge(task.code)}>重新判定并采用</ion-button>
+            </div>
+          </div>
+        )}
+        {task.holdReason && <p class="shoot-hold-reason">{task.holdReason}（拍摄组不替教师改步骤）</p>}
+      </div>
+    );
+  }
+
+  private renderCrewBoard() {
+    const tasks = this.project.shootTasks;
+    const counts = {
+      open: tasks.filter((task) => task.status === '拍摄中').length,
+      pending: tasks.filter((task) => task.status === '待确认').length,
+      confirmed: tasks.filter((task) => task.status === '已确认').length,
+    };
+    return (
+      <div class="crew-board">
+        <section class="form-card">
+          <div class="section-title"><span>01</span><div><h2>拍摄任务板</h2><p>教师每加一个示范步骤就开出一条任务，拍摄组按编号回传素材与机位</p></div></div>
+          <div class="crew-stats">
+            <div><strong>{tasks.length}</strong><span>总任务</span></div>
+            <div><strong>{counts.open}</strong><span>拍摄中</span></div>
+            <div class={counts.pending ? 'has-errors' : ''}><strong>{counts.pending}</strong><span>待教师确认</span></div>
+            <div><strong>{counts.confirmed}</strong><span>已确认</span></div>
+          </div>
+          <div class="crew-task-list">
+            {tasks.length === 0 && <p class="crew-empty">教师还没有开出拍摄任务。</p>}
+            {tasks.map((task) => this.renderCrewTask(task))}
+          </div>
+        </section>
+
+        <section class="form-card">
+          <div class="section-title"><span>02</span><div><h2>批量回传素材</h2><p>每行一条：任务编号, 机位, 素材地址（可附片段名称）。对不上的条目只挂起这几条。</p></div></div>
+          <ion-textarea
+            autoGrow
+            rows={4}
+            class="studio-input return-textarea"
+            placeholder={'STG-0001, 正面, assets/hello.mp4\nSTG-0003, 俯拍手部, assets/near.mp4, 多少钱 · 双手组合'}
+            value={this.returnDraft}
+            onIonInput={(event) => { this.returnDraft = event.detail.value ?? ''; }}
+          />
+          <div class="crew-return-actions">
+            <span>机位清单：正面 / 左侧 45° / 右侧 45° / 俯拍手部 / 全身远景</span>
+            <ion-button class="studio-button" disabled={this.project.status === 'frozen'} onClick={() => this.submitReturns(this.returnDraft)}>按编号回传</ion-button>
+          </div>
+          <p class="crew-boundary-hint">回传只更新素材地址与机位，压不到教师填写的字幕、替代文本与练习。</p>
+        </section>
+
+        <section class="form-card">
+          <div class="section-title"><span>03</span><div><h2>挂起条目（{this.project.pendingReturns.length}）</h2><p>失败后只重试这几条；对上的条目不受影响。</p></div></div>
+          <div class="suspended-list">
+            {this.project.pendingReturns.length === 0 && <p class="crew-empty">没有挂起条目。</p>}
+            {this.project.pendingReturns.map((item) => (
+              <div class="suspended-item" key={item.footage.id}>
+                <div>
+                  <strong>{item.footage.taskCode}</strong>
+                  <span>{item.reason}</span>
+                  <small>机位：{item.footage.camera || '(空)'} · 地址：{item.footage.assetUrl || '(空)'} · 已尝试 {item.attempts} 次 · {this.formatDate(item.lastAttemptAt)}</small>
+                </div>
+                <ion-button size="small" fill="outline" class="studio-button" disabled={this.project.status === 'frozen'} onClick={() => this.retryReturn(item.footage.taskCode)}>重试此条</ion-button>
+              </div>
+            ))}
+            {this.project.pendingReturns.length > 1 && (
+              <ion-button fill="clear" class="studio-button crew-retry-all" disabled={this.project.status === 'frozen'} onClick={() => this.retryReturn()}>重试全部挂起条目</ion-button>
+            )}
+          </div>
+        </section>
+      </div>
+    );
+  }
+
+  private renderCrewTask(task: ShootTask) {
+    const located = this.findStepLocation(task.stepId);
+    const active = footageById(this.project, task.activeFootageId);
+    const pending = this.project.footageLibrary.some((item) => item.taskCode === task.code && item.state === '回传待判');
+    return (
+      <button class={`crew-task status-${task.status === '已确认' ? 'confirmed' : task.status === '待确认' ? 'pending' : 'open'}`} onClick={() => located && this.selectStep(located.step.id)}>
+        <span class="shoot-code">{task.code}</span>
+        <span class="crew-task-copy">
+          <strong>{task.clipName}</strong>
+          <small>{located ? `${located.module.title} · ${located.step.title}` : '引用步骤已不存在'}</small>
+          {task.holdReason && <small class="crew-hold">{task.holdReason}</small>}
+        </span>
+        <span class="crew-task-meta">
+          <ion-badge color={task.status === '已确认' ? 'success' : task.status === '待确认' ? 'danger' : 'medium'}>{task.status}</ion-badge>
+          <small>{active ? `${active.state} · ${active.camera}` : pending ? '有新回传待判' : '尚无回传'}</small>
+        </span>
+      </button>
+    );
+  }
+
+  private findStepLocation(stepId: string): { module: CourseModule; step: LessonStep } | undefined {
+    for (const module of this.project.modules) {
+      const step = module.steps.find((candidate) => candidate.id === stepId);
+      if (step) return { module, step };
+    }
+    return undefined;
+  }
+
   private renderStepListItem(step: LessonStep, index: number) {
     const active = step.id === this.currentStep?.id;
     const issueCount = this.checks.filter((check) => check.stepId === step.id && check.severity !== 'info').length;
+    const task = taskForStep(this.project, step.id);
     return (
       <button class={`step-list-item ${active ? 'active' : ''}`} onClick={() => this.selectStep(step.id)}>
         <span class="step-index">{String(index + 1).padStart(2, '0')}</span>
         <span class="step-copy">
           <strong>{step.title}</strong>
-          <small>{step.kind} · {step.duration}s · {step.difficulty}</small>
+          <small>{step.kind} · {step.duration}s · {step.difficulty}{task ? ` · ${task.code} ${task.status}` : ''}</small>
         </span>
         {issueCount > 0 && <span class="step-issue-count">{issueCount}</span>}
       </button>
@@ -392,6 +639,8 @@ export class AppRoot {
           </div>
         )}
 
+        {this.renderShootBanner(step, frozen)}
+
         <section class="form-card">
           <div class="section-title"><span>01</span><div><h2>基础设计</h2><p>标题、类型、难度和预计时长</p></div></div>
           <div class="form-grid two">
@@ -422,7 +671,7 @@ export class AppRoot {
             </div>
           </div>
           <div class="form-grid two">
-            <ion-select disabled={frozen} label="镜头角度" labelPlacement="stacked" class="studio-input" value={step.camera} onIonChange={(event) => this.updateStep({ camera: event.detail.value as CameraAngle })}>
+            <ion-select disabled={frozen || Boolean(step.materialId)} label={step.materialId ? '镜头角度（以拍摄组回传为准）' : '镜头角度'} labelPlacement="stacked" class="studio-input" value={step.camera} onIonChange={(event) => this.updateStep({ camera: event.detail.value as CameraAngle })}>
               {(['正面', '左侧 45°', '右侧 45°', '俯拍手部', '全身远景'] as CameraAngle[]).map((item) => <ion-select-option value={item}>{item}</ion-select-option>)}
             </ion-select>
             <ion-select disabled={frozen} label="主要手形区域" labelPlacement="stacked" class="studio-input" value={step.gestureZone} onIonChange={(event) => this.updateStep({ gestureZone: event.detail.value as GestureZone })}>
@@ -550,17 +799,21 @@ export class AppRoot {
             <ion-toolbar>
               <ion-buttons slot="start"><div class="logo-mark">手</div><div class="app-title"><strong>SignCourse Studio</strong><span>手语课程编排工具</span></div></ion-buttons>
               <ion-buttons slot="end" class="header-actions">
+                <ion-segment value={this.role} class="role-segment" onIonChange={(event) => this.switchRole(event.detail.value as StudioRole)}>
+                  <ion-segment-button value="teacher">教师端</ion-segment-button>
+                  <ion-segment-button value="crew">拍摄组端</ion-segment-button>
+                </ion-segment>
                 <button class={`connection-status ${this.offline ? 'offline' : ''}`} onClick={() => { this.offline = !this.offline; this.showToast(this.offline ? 'warning' : 'success', this.offline ? '已进入离线模拟，编辑继续保存在本机。' : '已恢复在线模拟，本地草稿保持同步。'); }}><span />{this.offline ? '离线编辑中（点击恢复）' : '本地自动保存（点击模拟离线）'}</button>
                 <ion-button fill="clear" class="studio-button" disabled={this.past.length === 0} onClick={() => this.undo()}>撤销</ion-button>
                 <ion-button fill="clear" class="studio-button" disabled={this.future.length === 0} onClick={() => this.redo()}>重做</ion-button>
-                <ion-button fill="outline" class="studio-button" onClick={() => this.saveDraft()}>保存草稿</ion-button>
-                {this.project.status === 'review'
+                {this.role === 'teacher' && <ion-button fill="outline" class="studio-button" onClick={() => this.saveDraft()}>保存草稿</ion-button>}
+                {this.role === 'teacher' && (this.project.status === 'review'
                   ? <ion-button color="success" class="studio-button" onClick={() => this.freezeVersion()}>冻结版本</ion-button>
                   : this.project.status === 'changes'
                     ? <ion-button color="warning" class="studio-button" onClick={() => this.submitForReview()}>重新提交</ion-button>
                     : this.project.status === 'frozen'
                       ? <ion-button class="studio-button" onClick={() => this.reviseFrozen()}>创建修订版</ion-button>
-                      : <ion-button color="primary" class="studio-button" onClick={() => this.submitForReview()}>提交复核</ion-button>}
+                      : <ion-button color="primary" class="studio-button" onClick={() => this.submitForReview()}>提交复核</ion-button>)}
               </ion-buttons>
             </ion-toolbar>
           </ion-header>
@@ -569,7 +822,7 @@ export class AppRoot {
             <div class="project-ribbon">
               <div class="project-heading">
                 {this.renderStatusBadge()}
-                <ion-input value={this.project.title} class="project-title-input" onIonInput={(event) => { this.project = { ...this.project, title: event.detail.value ?? '' }; this.persist(); }} />
+                <ion-input disabled={this.role === 'crew'} value={this.project.title} class="project-title-input" onIonInput={(event) => { this.project = { ...this.project, title: event.detail.value ?? '' }; this.persist(); }} />
                 <span>{this.project.teacher} · {this.project.audience}</span>
               </div>
               <div class="project-metrics">
@@ -579,15 +832,15 @@ export class AppRoot {
                 <div class={errors ? 'has-errors' : ''}><strong>{errors}</strong><span>阻断问题</span></div>
               </div>
               <div class="workflow-actions">
-                {this.project.status === 'review' && <ion-button fill="clear" color="danger" class="studio-button" onClick={() => this.returnForChanges()}>退回修改</ion-button>}
-                {this.project.status === 'draft' && <ion-button fill="clear" class="studio-button" onClick={() => this.addModule()}>＋ 新建模块</ion-button>}
-                <ion-button fill="clear" class="studio-button" onClick={() => this.addStep('练习')}>＋ 练习步骤</ion-button>
+                {this.role === 'teacher' && this.project.status === 'review' && <ion-button fill="clear" color="danger" class="studio-button" onClick={() => this.returnForChanges()}>退回修改</ion-button>}
+                {this.role === 'teacher' && this.project.status === 'draft' && <ion-button fill="clear" class="studio-button" onClick={() => this.addModule()}>＋ 新建模块</ion-button>}
+                {this.role === 'teacher' && <ion-button fill="clear" class="studio-button" onClick={() => this.addStep('练习')}>＋ 练习步骤</ion-button>}
               </div>
             </div>
 
-            <main class="studio-workspace">
+            <main class={`studio-workspace ${this.role === 'crew' ? 'crew-workspace' : ''}`}>
               <aside class="course-panel">
-                <div class="panel-heading"><div><span class="eyebrow">课程结构</span><h2>模块与步骤</h2></div><button class="add-step-button" onClick={() => this.addStep('示范')}>＋</button></div>
+                <div class="panel-heading"><div><span class="eyebrow">课程结构</span><h2>模块与步骤</h2></div>{this.role === 'teacher' && <button class="add-step-button" onClick={() => this.addStep('示范')}>＋</button>}</div>
                 <div class="module-list">
                   {this.project.modules.map((item) => (
                     <section class={`module-card ${item.id === module?.id ? 'active' : ''}`} key={item.id}>
@@ -599,21 +852,29 @@ export class AppRoot {
                     </section>
                   ))}
                 </div>
-                <div class="module-editor">
+                {this.role === 'teacher' && <div class="module-editor">
                   <ion-input disabled={this.project.status === 'frozen'} label="当前模块标题" labelPlacement="stacked" class="studio-input" value={module?.title ?? ''} onIonInput={(event) => this.updateCurrentModule({ title: event.detail.value ?? '' })} />
                   <ion-textarea disabled={this.project.status === 'frozen'} autoGrow label="模块目标" labelPlacement="stacked" class="studio-input" value={module?.summary ?? ''} onIonInput={(event) => this.updateCurrentModule({ summary: event.detail.value ?? '' })} />
-                </div>
+                </div>}
+                {this.role === 'crew' && <div class="module-editor crew-readonly-hint">拍摄组只读课程结构，学习步骤与字幕由教师维护。</div>}
               </aside>
 
-              <section class="editor-panel">
+              {this.role === 'crew' ? (
+                <section class="editor-panel crew-panel">
+                  <div class="panel-switcher">
+                    <button class="active">拍摄任务与素材回传</button>
+                  </div>
+                  <div class="editor-scroll">{this.renderCrewBoard()}</div>
+                </section>
+              ) : <section class="editor-panel">
                 <div class="panel-switcher">
                   <button class={this.activePanel === 'editor' ? 'active' : ''} onClick={() => { this.activePanel = 'editor'; }}>步骤编排</button>
                   <button class={this.activePanel === 'checks' ? 'active' : ''} onClick={() => { this.activePanel = 'checks'; }}>发布前检查 <span>{this.checks.length}</span></button>
                 </div>
                 <div class="editor-scroll">{this.activePanel === 'editor' ? this.renderStepEditor() : this.renderChecks()}</div>
-              </section>
+              </section>}
 
-              {this.renderPreview()}
+              {this.role === 'teacher' && this.renderPreview()}
             </main>
           </ion-content>
           <ion-toast isOpen={Boolean(this.toast)} message={this.toast?.message} color={this.toast?.color} duration={3200} onDidDismiss={() => { this.toast = undefined; }} />

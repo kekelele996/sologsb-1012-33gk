@@ -11,10 +11,10 @@
 
 - ion-badge
 - ion-button
+- ion-textarea
 - ion-input
 - ion-select
 - ion-select-option
-- ion-textarea
 - ion-segment
 - ion-segment-button
 - ion-app
@@ -29,10 +29,10 @@
 graph TD;
   app-root --> ion-badge
   app-root --> ion-button
+  app-root --> ion-textarea
   app-root --> ion-input
   app-root --> ion-select
   app-root --> ion-select-option
-  app-root --> ion-textarea
   app-root --> ion-segment
   app-root --> ion-segment-button
   app-root --> ion-app
