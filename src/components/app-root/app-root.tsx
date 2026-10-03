@@ -1,7 +1,14 @@
 import { Component, Host, State, h, Listen } from '@stencil/core';
 import {
+  applyMaterialStatus,
+  captionSafeAreaOk,
   cloneProject,
   createDemoProject,
+  createShootTask,
+  formatTaskNo,
+  ingestReturnRows,
+  LEGACY_STORAGE_KEYS,
+  migrateProject,
   selectedModule,
   selectedStep,
   STORAGE_KEY,
@@ -12,11 +19,23 @@ import {
   type CourseProject,
   type Difficulty,
   type GestureZone,
+  type IngestOutcome,
   type LessonStep,
+  type MaterialStatus,
+  type ReturnRow,
   type ValidationCheck,
 } from '../../models';
 
 type PreviewSize = 'phone' | 'tablet';
+type Workspace = 'teacher' | 'studio';
+
+const emptyReturnRow = (): ReturnRow => ({
+  key: `row-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+  taskNo: '',
+  name: '',
+  url: '',
+  camera: '',
+});
 
 @Component({
   tag: 'app-root',
@@ -27,6 +46,8 @@ export class AppRoot {
   @State() project: CourseProject = createDemoProject();
   @State() previewSize: PreviewSize = 'phone';
   @State() activePanel: 'editor' | 'checks' = 'editor';
+  @State() workspace: Workspace = 'teacher';
+  @State() returnRows: ReturnRow[] = [emptyReturnRow()];
   @State() playing = false;
   @State() playProgress = 0;
   @State() offline = typeof navigator !== 'undefined' ? !navigator.onLine : false;
@@ -37,8 +58,12 @@ export class AppRoot {
 
   componentWillLoad(): void {
     try {
-      const saved = localStorage.getItem(STORAGE_KEY);
-      if (saved) this.project = JSON.parse(saved) as CourseProject;
+      const saved = localStorage.getItem(STORAGE_KEY) ?? LEGACY_STORAGE_KEYS.map((key) => localStorage.getItem(key)).find((value) => value !== null);
+      if (saved) {
+        // 旧数据没有拍摄任务编号，升级时按现有示范片段名称回填
+        this.project = migrateProject(JSON.parse(saved) as CourseProject);
+        this.persist();
+      }
     } catch {
       this.project = createDemoProject();
     }
@@ -158,7 +183,15 @@ export class AppRoot {
       ...draft,
       modules: draft.modules.map((module) => module.id === draft.selectedModuleId ? {
         ...module,
-        steps: module.steps.map((step) => step.id === stepId ? { ...step, ...patch } : step),
+        steps: module.steps.map((step) => {
+          if (step.id !== stepId) return step;
+          const merged = { ...step, ...patch };
+          // 教师换素材或改字幕位置后，按现状重判字幕安全区
+          if (merged.materialId || merged.materialReview === '待确认') {
+            merged.materialReview = captionSafeAreaOk(merged) ? '已确认' : '待确认';
+          }
+          return merged;
+        }),
       } : module),
     }), toast);
   }
@@ -186,6 +219,7 @@ export class AppRoot {
     const module = this.currentModule;
     if (!module) return this.addModule();
     const prior = module.steps.at(-1);
+    const taskNo = formatTaskNo(this.project.nextTaskSeq);
     const step: LessonStep = {
       id: `step-${Date.now().toString(36)}`,
       title: `新${kind}步骤 ${module.steps.length + 1}`,
@@ -205,26 +239,35 @@ export class AppRoot {
       prerequisiteId: prior?.id ?? '',
       difficulty: '入门',
       cuePoints: [8, 20, 32],
+      shootTaskNo: taskNo,
+      materialId: '',
+      materialReview: '已确认',
     };
+    // 教师每加一个示范步骤就开一条拍摄任务
     this.commit((draft) => ({
       ...draft,
       modules: draft.modules.map((item) => item.id === module.id ? { ...item, steps: [...item.steps, step] } : item),
+      shootTasks: [...draft.shootTasks, createShootTask(step, module.id, draft.nextTaskSeq)],
+      nextTaskSeq: draft.nextTaskSeq + 1,
       selectedStepId: step.id,
-    }), '已新增学习步骤。');
+    }), `已新增学习步骤，并开出拍摄任务 ${taskNo}。`);
   }
 
   private duplicateStep(): void {
     const step = this.currentStep;
     if (!step) return;
+    const taskNo = formatTaskNo(this.project.nextTaskSeq);
+    const duplicate: LessonStep = { ...structuredClone(step), id: `step-${Date.now().toString(36)}`, title: `${step.title}（副本）`, shootTaskNo: taskNo };
     this.commit((draft) => ({
       ...draft,
       modules: draft.modules.map((module) => {
         if (module.id !== draft.selectedModuleId) return module;
         const index = module.steps.findIndex((item) => item.id === step.id);
-        const duplicate = { ...structuredClone(step), id: `step-${Date.now().toString(36)}`, title: `${step.title}（副本）` };
         return { ...module, steps: [...module.steps.slice(0, index + 1), duplicate, ...module.steps.slice(index + 1)] };
       }),
-    }), '已复制当前步骤。');
+      shootTasks: [...draft.shootTasks, createShootTask(duplicate, draft.selectedModuleId, draft.nextTaskSeq)],
+      nextTaskSeq: draft.nextTaskSeq + 1,
+    }), `已复制当前步骤，并开出拍摄任务 ${taskNo}。`);
   }
 
   private deleteStep(stepId: string): void {
@@ -232,14 +275,17 @@ export class AppRoot {
       this.showToast('warning', '模块至少保留一个学习步骤。');
       return;
     }
+    const removedTaskNo = this.currentModule.steps.find((step) => step.id === stepId)?.shootTaskNo ?? '';
     this.commit((draft) => ({
       ...draft,
       modules: draft.modules.map((module) => module.id === draft.selectedModuleId ? {
         ...module,
         steps: module.steps.filter((step) => step.id !== stepId),
       } : module),
+      shootTasks: draft.shootTasks.filter((task) => task.stepId !== stepId),
+      suspendedReturns: draft.suspendedReturns.filter((row) => row.taskNo !== removedTaskNo),
       selectedStepId: this.currentModule.steps.find((step) => step.id !== stepId)?.id ?? '',
-    }), '已删除学习步骤。');
+    }), '已删除学习步骤及其拍摄任务。');
   }
 
   private moveStep(direction: number): void {
@@ -260,12 +306,109 @@ export class AppRoot {
     }), '已调整步骤顺序。');
   }
 
+  // —— 拍摄组工作台：按任务编号回传素材，不替教师改步骤 ——
+
+  private addReturnRow(): void {
+    this.returnRows = [...this.returnRows, emptyReturnRow()];
+  }
+
+  private updateReturnRow(key: string, patch: Partial<ReturnRow>): void {
+    this.returnRows = this.returnRows.map((row) => row.key === key ? { ...row, ...patch } : row);
+  }
+
+  private removeReturnRow(key: string): void {
+    this.returnRows = this.returnRows.filter((row) => row.key !== key);
+  }
+
+  private prefillPendingTasks(): void {
+    const pending = this.project.shootTasks.filter((task) => task.status === '待拍摄');
+    if (!pending.length) {
+      this.showToast('medium', '当前没有待拍摄的拍摄任务。');
+      return;
+    }
+    this.returnRows = pending.map((task) => ({ key: `row-${task.taskNo}`, taskNo: task.taskNo, name: task.clipName, url: '', camera: '' as const }));
+  }
+
+  private submitReturns(): void {
+    if (this.project.status === 'frozen') {
+      this.showToast('warning', '当前版本已冻结，请先创建修订版。');
+      return;
+    }
+    const rows = this.returnRows.filter((row) => row.taskNo.trim() || row.name.trim() || row.url.trim() || row.camera);
+    if (!rows.length) {
+      this.showToast('medium', '请先填写要回传的素材行。');
+      return;
+    }
+    let outcome: IngestOutcome = { applied: [], suspended: [] };
+    this.commit((draft) => {
+      const result = ingestReturnRows(draft, rows, `batch-${Date.now().toString(36)}`);
+      outcome = result.outcome;
+      // 对不上的只挂起这几条，对上的照常入库
+      return { ...result.project, suspendedReturns: [...result.project.suspendedReturns, ...result.outcome.suspended] };
+    });
+    this.returnRows = [emptyReturnRow()];
+    this.showToast(outcome.suspended.length ? 'warning' : 'success', `回传完成：${outcome.applied.length} 条已入库，${outcome.suspended.length} 条对不上已挂起。`);
+  }
+
+  private retrySuspended(): void {
+    if (this.project.status === 'frozen') {
+      this.showToast('warning', '当前版本已冻结，请先创建修订版。');
+      return;
+    }
+    if (!this.project.suspendedReturns.length) return;
+    let outcome: IngestOutcome = { applied: [], suspended: [] };
+    this.commit((draft) => {
+      // 失败后只重试挂起的这几条
+      const result = ingestReturnRows(draft, draft.suspendedReturns, `retry-${Date.now().toString(36)}`);
+      outcome = result.outcome;
+      return { ...result.project, suspendedReturns: result.outcome.suspended };
+    });
+    this.showToast(outcome.suspended.length ? 'warning' : 'success', `重试完成：${outcome.applied.length} 条已入库，仍有 ${outcome.suspended.length} 条挂起。`);
+  }
+
+  private updateSuspendedRow(key: string, patch: Partial<ReturnRow>): void {
+    this.commit((draft) => ({
+      ...draft,
+      suspendedReturns: draft.suspendedReturns.map((row) => row.key === key ? { ...row, ...patch } : row),
+    }));
+  }
+
+  private discardSuspended(key: string): void {
+    this.commit((draft) => ({ ...draft, suspendedReturns: draft.suspendedReturns.filter((row) => row.key !== key) }), '已丢弃该条挂起的回传。');
+  }
+
+  private setMaterialStatus(materialId: string, status: MaterialStatus): void {
+    if (this.project.status === 'frozen') {
+      this.showToast('warning', '当前版本已冻结，请先创建修订版。');
+      return;
+    }
+    const material = this.project.materials.find((item) => item.id === materialId);
+    if (!material) return;
+    let pending = 0;
+    this.commit((draft) => {
+      const result = applyMaterialStatus(draft, materialId, status);
+      pending = result.pendingStepIds.length;
+      return result.project;
+    });
+    const suffix = pending ? `，${pending} 个引用步骤退回待确认` : '';
+    this.showToast(status === '可用' ? 'success' : 'warning', `素材「${material.name}」已标为${status}${suffix}。`);
+  }
+
+  /** 教师换素材：回写素材与机位，并按新素材重判字幕安全区 */
+  private swapMaterial(materialId: string): void {
+    const material = this.project.materials.find((item) => item.id === materialId);
+    if (!material) {
+      this.updateStep({ materialId: '', demoUrl: '' }, '已取消素材关联。');
+      return;
+    }
+    this.updateStep({ materialId: material.id, demoUrl: material.url, camera: material.camera }, `已换用素材「${material.name}」，字幕安全区已按新素材重判。`);
+  }
+
   private saveDraft(showMessage = true): void {
     if (this.project.status === 'frozen') {
       this.showToast('warning', '冻结版本不可覆盖，请先创建修订版。');
       return;
-    }
-    this.project = { ...this.project, status: 'draft', lastSavedAt: new Date().toISOString() };
+    }    this.project = { ...this.project, status: 'draft', lastSavedAt: new Date().toISOString() };
     this.persist();
     if (showMessage) this.showToast('success', '草稿已保存在浏览器本地。');
   }
@@ -368,6 +511,7 @@ export class AppRoot {
     }
     const frozen = this.project.status === 'frozen';
     const module = this.currentModule;
+    const linkedMaterial = this.project.materials.find((item) => item.id === step.materialId);
     const prerequisites = module.steps.filter((candidate, index) => candidate.id !== step.id && index < module.steps.findIndex((item) => item.id === step.id));
     return (
       <div class="step-editor">
@@ -409,7 +553,7 @@ export class AppRoot {
         </section>
 
         <section class="form-card">
-          <div class="section-title"><span>02</span><div><h2>示范片段与镜头</h2><p>记录素材标识、手形、镜头角度和动作区域</p></div></div>
+          <div class="section-title"><span>02</span><div><h2>示范片段与镜头</h2><p>拍摄任务、素材、手形、镜头角度和动作区域</p></div></div>
           <div class="demo-row">
             <div class={`video-thumbnail zone-${step.gestureZone}`}>
               <span class="play-mark">▶</span>
@@ -421,6 +565,26 @@ export class AppRoot {
               <ion-input disabled={frozen} label="本地素材地址（可空）" labelPlacement="stacked" class="studio-input" value={step.demoUrl} placeholder="例如 assets/hello.mp4" onIonInput={(event) => this.updateStep({ demoUrl: event.detail.value ?? '' })} />
             </div>
           </div>
+          <div class="form-grid two">
+            <ion-input readonly label="拍摄任务编号" labelPlacement="stacked" class="studio-input" value={step.shootTaskNo || '未开任务'} />
+            <ion-select disabled={frozen} label="关联素材（教师可换素材）" labelPlacement="stacked" class="studio-input" value={step.materialId} onIonChange={(event) => this.swapMaterial(event.detail.value as string)}>
+              <ion-select-option value="">不关联素材</ion-select-option>
+              {this.project.materials.filter((item) => item.status === '可用' || item.id === step.materialId).map((item) => (
+                <ion-select-option value={item.id}>{item.name} · {item.camera}{item.status === '可用' ? '' : `（${item.status}）`}</ion-select-option>
+              ))}
+            </ion-select>
+          </div>
+          {linkedMaterial && linkedMaterial.status !== '可用' && (
+            <div class="material-alert">素材「{linkedMaterial.name}」已被拍摄组标为{linkedMaterial.status}，请换素材或等待重新回传。</div>
+          )}
+          {step.materialReview === '待确认' && (
+            <div class="review-callout">
+              <div>
+                <strong>字幕安全区待确认</strong>
+                <span>素材停用或重拍后，按新素材重判未达标。请换素材，或到「字幕与无障碍」调整字幕位置。</span>
+              </div>
+            </div>
+          )}
           <div class="form-grid two">
             <ion-select disabled={frozen} label="镜头角度" labelPlacement="stacked" class="studio-input" value={step.camera} onIonChange={(event) => this.updateStep({ camera: event.detail.value as CameraAngle })}>
               {(['正面', '左侧 45°', '右侧 45°', '俯拍手部', '全身远景'] as CameraAngle[]).map((item) => <ion-select-option value={item}>{item}</ion-select-option>)}
@@ -460,6 +624,107 @@ export class AppRoot {
           </div>
         </section>
       </div>
+    );
+  }
+
+  private renderReturnRowFields(row: ReturnRow, onPatch: (patch: Partial<ReturnRow>) => void, onRemove: () => void) {
+    return (
+      <div class="return-row">
+        <ion-input label="任务编号" labelPlacement="stacked" class="studio-input" value={row.taskNo} placeholder="ST-0001" onIonInput={(event) => onPatch({ taskNo: event.detail.value ?? '' })} />
+        <ion-input label="素材名称" labelPlacement="stacked" class="studio-input" value={row.name} onIonInput={(event) => onPatch({ name: event.detail.value ?? '' })} />
+        <ion-input label="素材地址" labelPlacement="stacked" class="studio-input" value={row.url} placeholder="assets/clip.mp4" onIonInput={(event) => onPatch({ url: event.detail.value ?? '' })} />
+        <ion-select label="机位" labelPlacement="stacked" class="studio-input" value={row.camera} onIonChange={(event) => onPatch({ camera: event.detail.value as CameraAngle })}>
+          {(['正面', '左侧 45°', '右侧 45°', '俯拍手部', '全身远景'] as CameraAngle[]).map((item) => <ion-select-option value={item}>{item}</ion-select-option>)}
+        </ion-select>
+        <button class="row-remove" title="移除该行" onClick={onRemove}>×</button>
+      </div>
+    );
+  }
+
+  private renderStudio() {
+    const stepOf = (taskNo: string) => {
+      const task = this.project.shootTasks.find((item) => item.taskNo === taskNo);
+      return task ? this.project.modules.find((module) => module.id === task.moduleId)?.steps.find((step) => step.id === task.stepId) : undefined;
+    };
+    const suspended = this.project.suspendedReturns;
+    return (
+      <main class="studio-workspace crew-workspace">
+        <aside class="course-panel">
+          <div class="panel-heading"><div><span class="eyebrow">拍摄组</span><h2>拍摄任务</h2></div><span class="task-count">{this.project.shootTasks.length}</span></div>
+          <div class="module-list">
+            {this.project.shootTasks.map((task) => {
+              const step = stepOf(task.taskNo);
+              const material = this.project.materials.find((item) => item.id === task.materialId);
+              return (
+                <section class="task-card" key={task.id}>
+                  <div class="task-head"><strong>{task.taskNo}</strong><span class={`task-status status-${task.status}`}>{task.status}</span></div>
+                  <div class="task-body">
+                    <strong>{task.clipName}</strong>
+                    <small>关联步骤：{step ? step.title : '步骤已删除'}</small>
+                    <small>素材：{material ? `${material.name}（${material.status}）` : '未回传'}</small>
+                  </div>
+                </section>
+              );
+            })}
+            {!this.project.shootTasks.length && <div class="empty-side">教师添加示范步骤后会自动开出拍摄任务。</div>}
+          </div>
+        </aside>
+
+        <section class="editor-panel">
+          <div class="panel-switcher"><button class="active">素材回传</button></div>
+          <div class="editor-scroll">
+            <div class="step-editor">
+              <section class="form-card">
+                <div class="section-title"><span>01</span><div><h2>按任务编号回传</h2><p>只回写素材与机位，不会覆盖教师填的字幕、替代文本与练习</p></div></div>
+                {this.returnRows.map((row) => this.renderReturnRowFields(row, (patch) => this.updateReturnRow(row.key, patch), () => this.removeReturnRow(row.key)))}
+                <div class="return-actions">
+                  <ion-button fill="outline" class="studio-button" onClick={() => this.addReturnRow()}>＋ 添加一行</ion-button>
+                  <ion-button fill="outline" class="studio-button" onClick={() => this.prefillPendingTasks()}>填入全部待拍任务</ion-button>
+                  <ion-button color="primary" class="studio-button" onClick={() => this.submitReturns()}>提交回传</ion-button>
+                </div>
+              </section>
+
+              <section class="form-card">
+                <div class="section-title"><span>02</span><div><h2>挂起的回传（{suspended.length}）</h2><p>对不上的条目只挂起这几条；修正后重试也只处理它们</p></div></div>
+                {suspended.length === 0 && <p class="muted-note">当前没有挂起的回传。</p>}
+                {suspended.map((row) => (
+                  <div class="suspended-row" key={row.key}>
+                    <div class="suspend-reason">{row.reason}</div>
+                    {this.renderReturnRowFields(row, (patch) => this.updateSuspendedRow(row.key, patch), () => this.discardSuspended(row.key))}
+                  </div>
+                ))}
+                {suspended.length > 0 && (
+                  <div class="return-actions">
+                    <ion-button color="warning" class="studio-button" onClick={() => this.retrySuspended()}>只重试这 {suspended.length} 条</ion-button>
+                  </div>
+                )}
+              </section>
+            </div>
+          </div>
+        </section>
+
+        <section class="preview-panel material-panel">
+          <div class="preview-head"><div><span class="eyebrow">示范素材库</span><h2>素材与状态</h2></div></div>
+          <div class="material-list">
+            {this.project.materials.map((material) => {
+              const usedBy = this.project.modules.flatMap((module) => module.steps).filter((step) => step.materialId === material.id);
+              return (
+                <section class="material-card" key={material.id}>
+                  <div class="material-head"><strong>{material.name}</strong><span class={`material-status ms-${material.status}`}>{material.status}</span></div>
+                  <small>{material.taskNo} · 机位 {material.camera} · {material.url || '无地址'}</small>
+                  <small>被 {usedBy.length} 个步骤引用{usedBy.length ? `：${usedBy.map((step) => step.title).join('、')}` : ''}</small>
+                  <div class="material-actions">
+                    {material.status !== '可用' && <ion-button size="small" fill="outline" class="studio-button" onClick={() => this.setMaterialStatus(material.id, '可用')}>恢复可用</ion-button>}
+                    {material.status !== '停用' && <ion-button size="small" fill="outline" color="danger" class="studio-button" onClick={() => this.setMaterialStatus(material.id, '停用')}>标为停用</ion-button>}
+                    {material.status !== '重拍' && <ion-button size="small" fill="outline" color="warning" class="studio-button" onClick={() => this.setMaterialStatus(material.id, '重拍')}>标为重拍</ion-button>}
+                  </div>
+                </section>
+              );
+            })}
+            {!this.project.materials.length && <div class="empty-side">回传后素材会进入素材库。</div>}
+          </div>
+        </section>
+      </main>
     );
   }
 
@@ -550,6 +815,10 @@ export class AppRoot {
             <ion-toolbar>
               <ion-buttons slot="start"><div class="logo-mark">手</div><div class="app-title"><strong>SignCourse Studio</strong><span>手语课程编排工具</span></div></ion-buttons>
               <ion-buttons slot="end" class="header-actions">
+                <ion-segment value={this.workspace} class="workspace-segment" onIonChange={(event) => { this.workspace = event.detail.value as Workspace; }}>
+                  <ion-segment-button value="teacher">教师</ion-segment-button>
+                  <ion-segment-button value="studio">拍摄组</ion-segment-button>
+                </ion-segment>
                 <button class={`connection-status ${this.offline ? 'offline' : ''}`} onClick={() => { this.offline = !this.offline; this.showToast(this.offline ? 'warning' : 'success', this.offline ? '已进入离线模拟，编辑继续保存在本机。' : '已恢复在线模拟，本地草稿保持同步。'); }}><span />{this.offline ? '离线编辑中（点击恢复）' : '本地自动保存（点击模拟离线）'}</button>
                 <ion-button fill="clear" class="studio-button" disabled={this.past.length === 0} onClick={() => this.undo()}>撤销</ion-button>
                 <ion-button fill="clear" class="studio-button" disabled={this.future.length === 0} onClick={() => this.redo()}>重做</ion-button>
@@ -585,6 +854,7 @@ export class AppRoot {
               </div>
             </div>
 
+            {this.workspace === 'teacher' ? (
             <main class="studio-workspace">
               <aside class="course-panel">
                 <div class="panel-heading"><div><span class="eyebrow">课程结构</span><h2>模块与步骤</h2></div><button class="add-step-button" onClick={() => this.addStep('示范')}>＋</button></div>
@@ -615,6 +885,7 @@ export class AppRoot {
 
               {this.renderPreview()}
             </main>
+            ) : this.renderStudio()}
           </ion-content>
           <ion-toast isOpen={Boolean(this.toast)} message={this.toast?.message} color={this.toast?.color} duration={3200} onDidDismiss={() => { this.toast = undefined; }} />
         </ion-app>

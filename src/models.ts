@@ -3,6 +3,9 @@ export type Difficulty = '入门' | '进阶' | '挑战';
 export type CameraAngle = '正面' | '左侧 45°' | '右侧 45°' | '俯拍手部' | '全身远景';
 export type CaptionPosition = '下方安全区' | '上移 15%' | '角标提示' | '画面中央';
 export type GestureZone = '左侧' | '中央' | '右侧';
+export type ShootTaskStatus = '待拍摄' | '已回传';
+export type MaterialStatus = '可用' | '停用' | '重拍';
+export type MaterialReview = '已确认' | '待确认';
 
 export interface LessonStep {
   id: string;
@@ -23,6 +26,12 @@ export interface LessonStep {
   prerequisiteId: string;
   difficulty: Difficulty;
   cuePoints: number[];
+  /** 拍摄任务编号：教师每加一个示范步骤就开一条拍摄任务 */
+  shootTaskNo: string;
+  /** 当前引用的示范素材 */
+  materialId: string;
+  /** 素材停用/重拍后按新素材重判字幕安全区的确认状态 */
+  materialReview: MaterialReview;
 }
 
 export interface CourseModule {
@@ -31,6 +40,44 @@ export interface CourseModule {
   summary: string;
   color: string;
   steps: LessonStep[];
+}
+
+/** 拍摄组持有的拍摄任务，按任务编号回传素材 */
+export interface ShootTask {
+  id: string;
+  taskNo: string;
+  stepId: string;
+  moduleId: string;
+  clipName: string;
+  status: ShootTaskStatus;
+  materialId: string;
+  createdAt: string;
+}
+
+/** 拍摄组回传的示范素材与机位 */
+export interface DemoMaterial {
+  id: string;
+  taskNo: string;
+  name: string;
+  url: string;
+  camera: CameraAngle;
+  status: MaterialStatus;
+  returnedAt: string;
+}
+
+/** 一条待回传的素材记录 */
+export interface ReturnRow {
+  key: string;
+  taskNo: string;
+  name: string;
+  url: string;
+  camera: CameraAngle | '';
+}
+
+/** 对不上任务编号而被挂起的回传，重试时只处理这些 */
+export interface SuspendedReturn extends ReturnRow {
+  reason: string;
+  batchId: string;
 }
 
 export interface FrozenVersion {
@@ -52,6 +99,10 @@ export interface CourseProject {
   frozenVersions: FrozenVersion[];
   lastSavedAt: string;
   revision: number;
+  shootTasks: ShootTask[];
+  materials: DemoMaterial[];
+  suspendedReturns: SuspendedReturn[];
+  nextTaskSeq: number;
 }
 
 export interface ValidationCheck {
@@ -63,7 +114,158 @@ export interface ValidationCheck {
   moduleId?: string;
 }
 
-export const STORAGE_KEY = 'sologsb-1012-sign-course-project-v1';
+export interface IngestOutcome {
+  applied: Array<{ taskNo: string; stepId: string; materialId: string }>;
+  suspended: SuspendedReturn[];
+}
+
+export const STORAGE_KEY = 'sologsb-1012-sign-course-project-v2';
+export const LEGACY_STORAGE_KEYS = ['sologsb-1012-sign-course-project-v1'];
+
+export function formatTaskNo(seq: number): string {
+  return `ST-${String(Math.max(1, seq)).padStart(4, '0')}`;
+}
+
+export function createShootTask(step: LessonStep, moduleId: string, seq: number): ShootTask {
+  return {
+    id: `task-${seq.toString(36)}-${Date.now().toString(36)}`,
+    taskNo: formatTaskNo(seq),
+    stepId: step.id,
+    moduleId,
+    clipName: step.demoTitle,
+    status: '待拍摄',
+    materialId: '',
+    createdAt: new Date().toISOString(),
+  };
+}
+
+/** 字幕安全区判定：画面中央字幕压中央手形或俯拍手部即不达标 */
+export function captionSafeAreaOk(step: Pick<LessonStep, 'captionPosition' | 'gestureZone' | 'camera'>): boolean {
+  return !(step.captionPosition === '画面中央' && (step.gestureZone === '中央' || step.camera === '俯拍手部'));
+}
+
+/**
+ * 拍摄组按任务编号批量回传素材与机位。
+ * 对不上的条目只挂起这几条，对上的照常入库；
+ * 回传只回写素材与机位，压不到教师填的字幕、替代文本与练习。
+ */
+export function ingestReturnRows(project: CourseProject, rows: ReturnRow[], batchId: string): { project: CourseProject; outcome: IngestOutcome } {
+  const next = cloneProject(project);
+  const outcome: IngestOutcome = { applied: [], suspended: [] };
+  rows.forEach((row, index) => {
+    const taskNo = row.taskNo.trim();
+    const suspend = (reason: string): void => {
+      outcome.suspended.push({ ...row, taskNo, reason, batchId });
+    };
+    if (!taskNo) return suspend('任务编号为空，无法匹配拍摄任务。');
+    const task = next.shootTasks.find((item) => item.taskNo === taskNo);
+    if (!task) return suspend(`找不到拍摄任务 ${taskNo}。`);
+    const module = next.modules.find((item) => item.id === task.moduleId);
+    const step = module?.steps.find((item) => item.id === task.stepId);
+    if (!module || !step) return suspend(`任务 ${taskNo} 关联的步骤已删除。`);
+    if (!row.name.trim()) return suspend('素材名称缺失。');
+    if (!row.camera) return suspend('机位信息缺失。');
+
+    const material: DemoMaterial = {
+      id: `mat-${Date.now().toString(36)}-${index}`,
+      taskNo,
+      name: row.name.trim(),
+      url: row.url.trim(),
+      camera: row.camera,
+      status: '可用',
+      returnedAt: new Date().toISOString(),
+    };
+    next.materials = [material, ...next.materials];
+    task.status = '已回传';
+    task.materialId = material.id;
+    // 只回写素材地址与机位；字幕、替代文本、练习等教师字段保持不动
+    step.materialId = material.id;
+    step.demoUrl = material.url;
+    step.camera = material.camera;
+    // 按新素材重判字幕安全区
+    step.materialReview = captionSafeAreaOk(step) ? '已确认' : '待确认';
+    outcome.applied.push({ taskNo, stepId: step.id, materialId: material.id });
+  });
+  return { project: next, outcome };
+}
+
+/**
+ * 素材被标成停用或重拍后，引用它的步骤按新素材重判字幕安全区，
+ * 不达标的退回待确认，由教师换素材或改字幕位置。
+ */
+export function applyMaterialStatus(project: CourseProject, materialId: string, status: MaterialStatus): { project: CourseProject; pendingStepIds: string[] } {
+  const next = cloneProject(project);
+  const material = next.materials.find((item) => item.id === materialId);
+  const pendingStepIds: string[] = [];
+  if (!material) return { project: next, pendingStepIds };
+  material.status = status;
+  if (status === '重拍') {
+    const task = next.shootTasks.find((item) => item.taskNo === material.taskNo);
+    if (task) task.status = '待拍摄';
+  }
+  next.modules.forEach((module) => {
+    module.steps.forEach((step) => {
+      if (step.materialId !== materialId) return;
+      step.materialReview = captionSafeAreaOk(step) ? '已确认' : '待确认';
+      if (step.materialReview === '待确认') pendingStepIds.push(step.id);
+    });
+  });
+  return { project: next, pendingStepIds };
+}
+
+/**
+ * 旧数据没有拍摄任务编号：升级时先按现有示范片段名称认领或补开任务，
+ * 再按片段名称回填素材与机位。
+ */
+export function migrateProject(project: CourseProject): CourseProject {
+  project.shootTasks = Array.isArray(project.shootTasks) ? project.shootTasks : [];
+  project.materials = Array.isArray(project.materials) ? project.materials : [];
+  project.suspendedReturns = Array.isArray(project.suspendedReturns) ? project.suspendedReturns : [];
+  let seq = typeof project.nextTaskSeq === 'number' && project.nextTaskSeq > 0 ? project.nextTaskSeq : 1;
+  project.shootTasks.forEach((task) => {
+    const match = /^ST-(\d+)$/.exec(task.taskNo ?? '');
+    if (match) seq = Math.max(seq, Number(match[1]) + 1);
+  });
+
+  project.modules.forEach((module) => {
+    module.steps.forEach((step) => {
+      step.materialId = step.materialId ?? '';
+      step.materialReview = step.materialReview ?? '已确认';
+      if (step.shootTaskNo) return;
+      const claimed = new Set(project.modules.flatMap((item) => item.steps.map((s) => s.shootTaskNo).filter(Boolean)));
+      const existing = project.shootTasks.find((task) => task.clipName === step.demoTitle && !claimed.has(task.taskNo));
+      if (existing) {
+        existing.stepId = step.id;
+        existing.moduleId = module.id;
+        step.shootTaskNo = existing.taskNo;
+      } else {
+        const task = createShootTask(step, module.id, seq++);
+        project.shootTasks.push(task);
+        step.shootTaskNo = task.taskNo;
+      }
+    });
+  });
+
+  project.modules.forEach((module) => {
+    module.steps.forEach((step) => {
+      if (step.materialId) return;
+      const material = project.materials.find((item) => item.name === step.demoTitle && item.status === '可用');
+      if (!material) return;
+      step.materialId = material.id;
+      step.demoUrl = step.demoUrl || material.url;
+      step.camera = material.camera;
+      step.materialReview = captionSafeAreaOk(step) ? '已确认' : '待确认';
+      const task = project.shootTasks.find((item) => item.taskNo === step.shootTaskNo);
+      if (task && !task.materialId) {
+        task.materialId = material.id;
+        task.status = '已回传';
+      }
+    });
+  });
+
+  project.nextTaskSeq = seq;
+  return project;
+}
 
 export function createDemoProject(): CourseProject {
   const modules: CourseModule[] = [
@@ -92,6 +294,9 @@ export function createDemoProject(): CourseProject {
           prerequisiteId: '',
           difficulty: '入门',
           cuePoints: [4, 16, 28],
+          shootTaskNo: '',
+          materialId: '',
+          materialReview: '已确认',
         },
         {
           id: 'step-1-2',
@@ -112,6 +317,9 @@ export function createDemoProject(): CourseProject {
           prerequisiteId: 'step-1-1',
           difficulty: '入门',
           cuePoints: [6, 24, 42],
+          shootTaskNo: '',
+          materialId: '',
+          materialReview: '已确认',
         },
         {
           id: 'step-1-3',
@@ -132,6 +340,9 @@ export function createDemoProject(): CourseProject {
           prerequisiteId: 'step-1-2',
           difficulty: '进阶',
           cuePoints: [10, 34, 57],
+          shootTaskNo: '',
+          materialId: '',
+          materialReview: '已确认',
         },
       ],
     },
@@ -160,6 +371,9 @@ export function createDemoProject(): CourseProject {
           prerequisiteId: '',
           difficulty: '入门',
           cuePoints: [8, 26, 44],
+          shootTaskNo: '',
+          materialId: '',
+          materialReview: '已确认',
         },
         {
           id: 'step-2-2',
@@ -180,10 +394,49 @@ export function createDemoProject(): CourseProject {
           prerequisiteId: 'step-2-1',
           difficulty: '进阶',
           cuePoints: [5, 22, 37],
+          shootTaskNo: '',
+          materialId: '',
+          materialReview: '已确认',
         },
       ],
     },
   ];
+
+  // 教师每加一个示范步骤就开一条拍摄任务
+  const shootTasks: ShootTask[] = [];
+  const materials: DemoMaterial[] = [];
+  let seq = 1;
+  modules.forEach((module) => {
+    module.steps.forEach((step) => {
+      const task = createShootTask(step, module.id, seq++);
+      shootTasks.push(task);
+      step.shootTaskNo = task.taskNo;
+    });
+  });
+
+  // 拍摄组已回传的示范素材
+  const seedMaterial = (step: LessonStep, camera: CameraAngle, url: string): void => {
+    const task = shootTasks.find((item) => item.taskNo === step.shootTaskNo);
+    if (!task) return;
+    const material: DemoMaterial = {
+      id: `mat-${task.taskNo.toLowerCase()}`,
+      taskNo: task.taskNo,
+      name: step.demoTitle,
+      url,
+      camera,
+      status: '可用',
+      returnedAt: new Date().toISOString(),
+    };
+    materials.push(material);
+    task.status = '已回传';
+    task.materialId = material.id;
+    step.materialId = material.id;
+    step.demoUrl = url;
+    step.camera = camera;
+    step.materialReview = captionSafeAreaOk(step) ? '已确认' : '待确认';
+  };
+  seedMaterial(modules[0].steps[0], '正面', 'assets/hello-front.mp4');
+  seedMaterial(modules[1].steps[0], '正面', 'assets/numbers-mirror.mp4');
 
   return {
     id: 'sign-course-project',
@@ -197,6 +450,10 @@ export function createDemoProject(): CourseProject {
     frozenVersions: [],
     lastSavedAt: new Date().toISOString(),
     revision: 1,
+    shootTasks,
+    materials,
+    suspendedReturns: [],
+    nextTaskSeq: seq,
   };
 }
 
@@ -211,6 +468,7 @@ export function selectedStep(project: CourseProject): LessonStep | undefined {
 
 export function validateProject(project: CourseProject): ValidationCheck[] {
   const checks: ValidationCheck[] = [];
+  const materials = project.materials ?? [];
   if (!project.title.trim()) checks.push({ id: 'title', severity: 'error', title: '课程标题缺失', detail: '发布前需要为课程填写清晰标题。' });
   if (project.modules.length === 0) checks.push({ id: 'modules', severity: 'error', title: '没有课程模块', detail: '至少需要创建一个包含学习步骤的模块。' });
 
@@ -225,8 +483,15 @@ export function validateProject(project: CourseProject): ValidationCheck[] {
       if (!step.caption.trim()) {
         checks.push({ id: `caption-${step.id}`, severity: 'warning', title: `${step.title} 缺少字幕`, detail: '听障学习者在静音预览时无法获得说明。', stepId: step.id, moduleId: module.id });
       }
-      if (step.captionPosition === '画面中央' && (step.gestureZone === '中央' || step.camera === '俯拍手部')) {
+      if (!captionSafeAreaOk(step)) {
         checks.push({ id: `overlap-${step.id}`, severity: 'error', title: `${step.title} 字幕可能遮挡动作`, detail: `字幕位于${step.captionPosition}，而主要手形位于${step.gestureZone}。`, stepId: step.id, moduleId: module.id });
+      }
+      if (step.materialReview === '待确认') {
+        checks.push({ id: `review-${step.id}`, severity: 'error', title: `${step.title} 的字幕安全区待确认`, detail: '素材停用或重拍后按新素材重判未达标，请换素材或调整字幕位置。', stepId: step.id, moduleId: module.id });
+      }
+      const material = materials.find((item) => item.id === step.materialId);
+      if (material && material.status !== '可用') {
+        checks.push({ id: `material-${step.id}`, severity: 'warning', title: `${step.title} 引用的素材已${material.status}`, detail: `素材「${material.name}」当前为${material.status}状态，发布前请换素材或等待重新回传。`, stepId: step.id, moduleId: module.id });
       }
       if (step.duration < 20) {
         checks.push({ id: `duration-${step.id}`, severity: 'warning', title: `${step.title} 时长过短`, detail: '示范与练习不足 20 秒，学习者来不及观察和跟做。', stepId: step.id, moduleId: module.id });
